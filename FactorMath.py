@@ -5,34 +5,28 @@ Number Foundry - a small factory game about numbers.
 A "1" leaves the source and rides a belt through your machines. Machines change
 the number by a RANDOM amount (you only choose which machine goes where).
 Whatever reaches the Export pays money equal to its value - up to the crate
-limit - and money buys more machines, slots and upgrades.
+limit - and money buys more machines, belt tiles and upgrades.
 
-Run:  python number_foundry.py        (needs only Python 3.8+ with tkinter)
+Run:  python FactorMath.py        (needs only Python 3.8+ with tkinter)
 """
 import json
 import math
 import random
-import sys
 import time
 import tkinter as tk
-import tkinter.font as tkfont
 from collections import deque
 from pathlib import Path
 from tkinter import messagebox
 
 # ------------------------------------------------------------------ layout --
-W, H = 1200, 720
-HEADER_H = 76
-BELT_Y = 200
-SLOT_W = 88
-MAX_SLOTS, START_SLOTS = 10, 3
-SRC_X1 = 118
-BELT_X0 = 126
-BELT_X1 = BELT_X0 + SLOT_W * MAX_SLOTS          # export starts here
-SLOT_TOP, SLOT_BOT = 126, 274
-LANES = (-18, 0, 18)
-GAP_PX = 30                                       # min spacing between spawns
+W, H = 1280, 800
+COLS, ROWS = 18, 10
+TILE_COST = 5
+TILE_DISTANCE = 64.0
 MAX_ITEMS = 500
+MAX_VALUE = 1e100
+DIRECTIONS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+ARROWS = ("\u2192", "\u2193", "\u2190", "\u2191")
 SAVE_PATH = Path(__file__).with_name("number_foundry_save.json")
 
 # ------------------------------------------------------------------ colors --
@@ -43,26 +37,38 @@ MONEY, GOOD, BAD = "#ffc15e", "#7be0b0", "#ff8080"
 PALETTE = ["#bfe3ff", "#8ff0c4", "#f6e77a", "#ffb35c", "#ff7f73", "#f08bff", "#a996ff", "#ffffff"]
 
 MACHINES = {
-    "mul": dict(name="Multiplier", sym="\u00d7", color="#ffb347", cost=10, unlock=0),
-    "div": dict(name="Divider", sym="\u00f7", color="#6ec8ff", cost=40, unlock=0),
-    "pow": dict(name="Exponentiator", sym="^", color="#d6a3ff", cost=500, unlock=2500),
+    "add": dict(name="Adder", sym="+", color="#7be0b0", cost=10, unlock=0),
+    "mul": dict(name="Multiplier", sym="\u00d7", color="#ffb347", cost=75, unlock=0),
+    "div": dict(name="Divider", sym="\u00f7", color="#6ec8ff", cost=500, unlock=0),
+    "pow": dict(name="Exponentiator", sym="^", color="#d6a3ff", cost=50000, unlock=100000),
 }
-MACHINE_ORDER = ["mul", "div", "pow"]
+MACHINE_ORDER = ["add", "mul", "div", "pow"]
+MAX_MACHINE_LEVEL = 6
+
+# Eighteen escalating contracts form an hour-ish campaign. The exact time depends
+# on how actively the player redesigns and upgrades the factory.
+ORDER_TARGETS = (50, 250, 1000, 5000, 25000, 100000, 500000, 2e6, 10e6,
+                 50e6, 250e6, 1e9, 5e9, 25e9, 100e9, 500e9, 2e12, 10e12)
+RESEARCH = {
+    "profit": ("Export efficiency", 5, lambda level: level + 1),
+    "power": ("Machine engineering", 3, lambda level: (level + 1) * 2),
+    "drive": ("Overdrive cooling", 4, lambda level: level + 1),
+}
 
 # key: (name, max level, base cost, cost growth, value-as-function-of-level)
 UPGRADES = {
-    "rate": ("Source speed", 25, 25, 2.2, lambda l: 2.0 * 0.85 ** l),
-    "belt": ("Belt speed", 10, 60, 2.8, lambda l: 120.0 * 1.2 ** l),
-    "mulq": ("Multiplier quality", 30, 80, 3.6, lambda l: (2 + 0.4 * l, 3 + 0.8 * l)),
-    "luck": ("Lucky rolls", 10, 200, 4.5, lambda l: 1 + 0.4 * l),
-    "split": ("Splitter capacity", 6, 300, 6.0, lambda l: 3 + l),
-    "cap": ("Export crate limit", 30, 300, 7.0, lambda l: 100.0 * 10 ** l),
-    "seed": ("Seed value", 9, 600, 6.0, lambda l: 1 + l),
+    "rate": ("Source speed", 12, 50, 2.3, lambda l: 2.5 * 0.88 ** l),
+    "belt": ("Belt speed", 10, 75, 2.5, lambda l: 100.0 * 1.18 ** l),
+    "mulq": ("Multiplier quality", 12, 250, 2.7, lambda l: (1.5 + 0.15 * l, 2.0 + 0.25 * l)),
+    "luck": ("Lucky rolls", 8, 500, 3.0, lambda l: 1 + 0.35 * l),
+    "split": ("Splitter capacity", 6, 1000, 3.0, lambda l: 2 + l),
+    "cap": ("Export crate limit", 18, 1000, 4.0, lambda l: 100.0 * 4 ** l),
+    "seed": ("Seed value", 12, 2000, 4.0, lambda l: 1 + 2 * l),
 }
 UPGRADE_ORDER = list(UPGRADES)
 UPGRADE_TIPS = {
-    "rate": "How often the source releases a new number. The belt can only carry so many, see Belt speed.",
-    "belt": "A faster belt shortens the trip and raises the throughput limit (items can't sit closer than ~30 px).",
+    "rate": "How often the source releases a new number. A connected route is required to release numbers.",
+    "belt": "A faster belt shortens the trip through your factory.",
     "mulq": "Raises both ends of every Multiplier's random range.",
     "luck": "Multiplier rolls land nearer the top of their range. The range itself doesn't change.",
     "split": "Dividers can cut a number into more pieces at once. Each piece carries an equal share.",
@@ -101,18 +107,29 @@ def mix(a, b, t):
     return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
 
 
-def slot_cx(i):
-    return BELT_X0 + SLOT_W * (i + 0.5)
+
+def inside(cell):
+    return 0 <= cell[0] < COLS and 0 <= cell[1] < ROWS
+
+
+def machine(typ, level=1, invested=None):
+    return dict(type=typ, level=level,
+                invested=MACHINES[typ]["cost"] if invested is None else invested,
+                last=None, flash=0.0)
+
+
+def clock(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
 class Item:
-    __slots__ = ("x", "lane", "val", "nxt")
+    __slots__ = ('step', 'progress', 'val')
 
-    def __init__(self, x, lane, val, nxt):
-        self.x, self.lane, self.val, self.nxt = x, lane, val, nxt
+    def __init__(self, step, progress, val):
+        self.step, self.progress, self.val = step, progress, val
 
 
-# --------------------------------------------------------------- simulation --
 class Sim:
     def __init__(self):
         self.reset()
@@ -120,14 +137,20 @@ class Sim:
     def reset(self):
         self.money, self.total, self.best, self.delivered = 10.0, 0.0, 0.0, 0
         self.lv = {k: 0 for k in UPGRADES}
-        self.slots_open = START_SLOTS
-        self.slots = [None] * MAX_SLOTS
+        self.research = {k: 0 for k in RESEARCH}
+        self.blueprints = self.order = 0
+        self.source, self.export, self.source_dir = (1, 4), (5, 4), 0
+        self.belts = {(x, 4): 0 for x in range(2, 5)}
+        self.machines = {}
         self.pow_unlocked = False
-        self.items, self.floaters, self.recent = [], [], deque()
-        self.t = self.phase = self.since_spawn = 0.0
-        self.export_flash = self.last_paid = 0.0
+        self.paused = False
+        self.items, self.recent = [], deque()
+        self.t = self.since_spawn = self.last_paid = 0.0
+        self.combo = 0
+        self.last_delivery_time = -100.0
+        self.overdrive_charge = self.overdrive_time = 0.0
+        self.rebuild_route()
 
-    # parameters derived from upgrade levels
     def p(self, key, level=None):
         return UPGRADES[key][4](self.lv[key] if level is None else level)
 
@@ -135,467 +158,662 @@ class Sim:
         _, _, base, growth, _ = UPGRADES[key]
         return base * growth ** self.lv[key]
 
-    def slot_cost(self):
-        return 400.0 * 12 ** (self.slots_open - START_SLOTS)
-
     def income(self):
         while self.recent and self.recent[0][0] < self.t - 10:
             self.recent.popleft()
         return sum(v for _, v in self.recent) / max(2.0, min(10.0, self.t))
 
-    # ---- player actions (return an error message or None)
-    def place(self, i, typ):
-        if i >= self.slots_open:
-            return "That slot is still locked."
-        spec, old = MACHINES[typ], self.slots[i]
-        if old and old["type"] == typ:
-            return None
-        refund = MACHINES[old["type"]]["cost"] * 0.5 if old else 0
-        if self.money + refund < spec["cost"]:
-            return "Not enough money."
-        self.money += refund - spec["cost"]
-        self.slots[i] = {"type": typ, "last": None, "flash": 0.0}
+    def order_target(self):
+        return ORDER_TARGETS[self.order] if self.order < len(ORDER_TARGETS) else None
 
-    def sell(self, i):
-        m = self.slots[i] if i < self.slots_open else None
-        if m:
-            self.money += MACHINES[m["type"]]["cost"] * 0.5
-            self.slots[i] = None
+    def order_reward(self):
+        target = self.order_target()
+        return target * 0.25 if target is not None else 0
 
-    def unlock_slot(self):
-        if self.slots_open >= MAX_SLOTS:
-            return None
-        if self.money < self.slot_cost():
-            return "Not enough money."
-        self.money -= self.slot_cost()
-        self.slots_open += 1
+    def claim_order(self):
+        target = self.order_target()
+        if target is None:
+            return 'All contracts complete. You built a legendary foundry!'
+        if self.total < target:
+            return f'Export ${fmt(target - self.total)} more to finish this contract.'
+        reward = self.order_reward()
+        self.money += reward
+        self.blueprints += 1
+        self.order += 1
+        return f'Contract complete: +${fmt(reward)} and +1 blueprint.'
+
+    def research_cost(self, key):
+        return RESEARCH[key][2](self.research[key])
+
+    def buy_research(self, key):
+        if key not in RESEARCH:
+            return 'Unknown research.'
+        if self.research[key] >= RESEARCH[key][1]:
+            return 'This research is already complete.'
+        cost = self.research_cost(key)
+        if self.blueprints < cost:
+            return f'You need {cost} blueprints.'
+        self.blueprints -= cost
+        self.research[key] += 1
+
+    def activate_overdrive(self):
+        if self.overdrive_time > 0:
+            return 'Overdrive is already active.'
+        if self.overdrive_charge < 100:
+            return f'Overdrive is only {self.overdrive_charge:.0f}% charged.'
+        self.overdrive_charge = 0.0
+        self.overdrive_time = 15.0 + 5.0 * self.research['drive']
+
+    def machine_upgrade_cost(self, cell):
+        m = self.machines[cell]
+        return MACHINES[m['type']]['cost'] * 2.5 ** m['level']
+
+    def upgrade_machine(self, cell):
+        if cell not in self.machines:
+            return 'Place a machine here first.'
+        m = self.machines[cell]
+        if m['level'] >= MAX_MACHINE_LEVEL:
+            return 'This machine is already at maximum level.'
+        cost = self.machine_upgrade_cost(cell)
+        if self.money < cost:
+            return f'You need ${fmt(cost)} to upgrade this machine.'
+        self.money -= cost
+        m['invested'] += cost
+        m['level'] += 1
+
+    def rebuild_route(self):
+        # Editing clears in-flight numbers, so an item never repeats a machine
+        # because the path underneath it was rearranged.
+        self.items = []
+        self.since_spawn = 0.0
+        self.route = [self.source]
+        seen = {self.source}
+        cell, direction = self.source, self.source_dir
+        while True:
+            dx, dy = DIRECTIONS[direction]
+            cell = (cell[0] + dx, cell[1] + dy)
+            if cell == self.export:
+                self.route.append(cell)
+                self.route_error = ''
+                return
+            if cell in seen:
+                self.route_error = 'Loop: turn a tile toward the export to finish the route.'
+                return
+            if not inside(cell) or cell not in self.belts:
+                self.route_error = 'Disconnected: follow the arrows and connect the source to export.'
+                return
+            seen.add(cell)
+            self.route.append(cell)
+            direction = self.belts[cell]
+
+    def place_belt(self, cell, direction):
+        if not inside(cell) or cell == self.export:
+            return 'Choose an empty grid tile or an existing belt.'
+        if cell == self.source:
+            if self.source_dir != direction:
+                self.source_dir = direction
+                self.rebuild_route()
+            return
+        if cell not in self.belts:
+            if self.money < TILE_COST:
+                return 'Not enough money. One belt tile costs $5.'
+            self.money -= TILE_COST
+        elif self.belts[cell] == direction:
+            return
+        self.belts[cell] = direction
+        self.rebuild_route()
+
+    def rotate(self, cell):
+        if cell == self.source:
+            return self.place_belt(cell, (self.source_dir + 1) % 4)
+        if cell in self.belts:
+            return self.place_belt(cell, (self.belts[cell] + 1) % 4)
+        return 'Click a belt or the source to rotate it.'
+
+    def move_export(self, cell):
+        if cell == self.export:
+            return
+        if not inside(cell) or cell == self.source or cell in self.belts:
+            return 'Place the export on an empty tile beside the end of your belt.'
+        self.export = cell
+        self.rebuild_route()
+
+    def place(self, cell, typ):
+        if cell not in self.belts:
+            return 'Machines must be placed on belt tiles.'
+        if typ not in MACHINES or (typ == 'pow' and not self.pow_unlocked):
+            return 'Unlock the Exponentiator first.'
+        old = self.machines.get(cell)
+        if old and old['type'] == typ:
+            return self.upgrade_machine(cell)
+        refund = old['invested'] * 0.5 if old else 0
+        if self.money + refund < MACHINES[typ]['cost']:
+            return 'Not enough money.'
+        self.money += refund - MACHINES[typ]['cost']
+        self.machines[cell] = machine(typ)
+
+    def sell(self, cell):
+        if cell in self.machines:
+            self.money += self.machines.pop(cell)['invested'] * 0.5
+        elif cell in self.belts:
+            del self.belts[cell]
+            self.money += TILE_COST
+            self.rebuild_route()
+        else:
+            return 'Click a machine or belt to sell it. Source and export cannot be sold.'
 
     def unlock_machine(self, typ):
-        if self.money < MACHINES[typ]["unlock"]:
-            return "Not enough money."
-        self.money -= MACHINES[typ]["unlock"]
+        if self.pow_unlocked:
+            return
+        if self.money < MACHINES[typ]['unlock']:
+            return 'Not enough money.'
+        self.money -= MACHINES[typ]['unlock']
         self.pow_unlocked = True
 
     def buy_upgrade(self, key):
         if self.lv[key] >= UPGRADES[key][1]:
-            return None
+            return
         if self.money < self.upgrade_cost(key):
-            return "Not enough money."
+            return 'Not enough money.'
         self.money -= self.upgrade_cost(key)
         self.lv[key] += 1
 
-    # ---- simulation
-    def pop(self, x, y, text, color):
-        if len(self.floaters) < 60:
-            self.floaters.append([x, y, text, color, 1.0])
-
     def update(self, dt):
+        if self.paused:
+            return
         self.t += dt
-        spd = self.p("belt")
-        self.phase = (self.phase + spd * dt) % 26
+        self.overdrive_time = max(0.0, self.overdrive_time - dt)
+        if self.t - self.last_delivery_time > 1.5:
+            self.combo = 0
+        for m in self.machines.values():
+            m['flash'] = max(0.0, m['flash'] - dt)
+        if self.route_error:
+            return
+        drive = 2.0 if self.overdrive_time > 0 else 1.0
+        spawn_rate = self.p('rate') / drive
         self.since_spawn += dt
-        need = max(self.p("rate"), GAP_PX / spd)
-        if self.since_spawn >= need:
-            self.since_spawn = min(self.since_spawn - need, need)
+        if self.since_spawn >= spawn_rate:
+            self.since_spawn = min(self.since_spawn - spawn_rate, spawn_rate)
             if len(self.items) < MAX_ITEMS:
-                self.items.append(Item(BELT_X0, 0, float(self.p("seed")), 0))
-
+                self.items.append(Item(0, 0.0, float(self.p('seed'))))
         keep, new = [], []
         for it in self.items:
-            it.x += spd * dt
-            while it.nxt < MAX_SLOTS and it.x >= slot_cx(it.nxt):
-                si = it.nxt
-                it.nxt += 1
-                if si < self.slots_open and self.slots[si]:
-                    self.process(it, si, new)
-            if it.x >= BELT_X1:
+            it.progress += self.p('belt') * drive * dt / TILE_DISTANCE
+            while it.progress >= 1 and it.step < len(self.route) - 1:
+                it.progress -= 1
+                it.step += 1
+                cell = self.route[it.step]
+                if cell in self.machines:
+                    self.process(it, cell, new)
+            if it.step == len(self.route) - 1:
                 self.deliver(it)
             else:
                 keep.append(it)
         self.items = keep + new
 
-        for m in self.slots:
-            if m:
-                m["flash"] = max(0.0, m["flash"] - dt)
-        self.export_flash = max(0.0, self.export_flash - dt)
-        for f in self.floaters:
-            f[1] -= 28 * dt
-            f[4] -= dt * 1.1
-        self.floaters = [f for f in self.floaters if f[4] > 0]
-
-    def process(self, it, si, new):
-        m = self.slots[si]
-        m["flash"] = 0.25
-        cx, typ = slot_cx(si), m["type"]
-        color = MACHINES[typ]["color"]
-        if typ == "mul":
-            lo, hi = self.p("mulq")
-            f = round(lo + (hi - lo) * random.random() ** (1.0 / self.p("luck")), 2)
-            it.val *= f
-            m["last"] = f"\u00d7{f:.2f}"
-        elif typ == "pow":
-            e = round(random.uniform(1.10, 1.35), 2)
-            it.val **= e
-            m["last"] = f"^{e:.2f}"
+    def process(self, it, cell, new):
+        m = self.machines[cell]
+        m['flash'] = 0.25
+        typ = m['type']
+        effective_level = m['level'] + self.research['power'] + (1 if self.overdrive_time > 0 else 0)
+        if typ == 'add':
+            amount = random.randint(effective_level, 3 * effective_level)
+            it.val = min(MAX_VALUE, it.val + amount)
+            m['last'] = f'+{amount}'
+        elif typ == 'mul':
+            lo, hi = self.p('mulq')
+            lo += 0.12 * (effective_level - 1)
+            hi += 0.20 * (effective_level - 1)
+            factor = round(lo + (hi - lo) * random.random() ** (1.0 / self.p('luck')), 2)
+            it.val = min(MAX_VALUE, it.val * factor)
+            m['last'] = f'×{factor:.2f}'
+        elif typ == 'pow':
+            exponent = round(random.uniform(1.04 + .015 * effective_level,
+                                            1.08 + .025 * effective_level), 2)
+            # Logarithms prevent an overflow on long, powerful factory routes.
+            it.val = 10 ** min(100.0, math.log10(it.val) * exponent) if it.val > 0 else 0.0
+            m['last'] = f'^{exponent:.2f}'
         else:
-            d = random.randint(2, self.p("split"))
-            if len(self.items) + len(new) + d > MAX_ITEMS:
-                self.pop(cx, SLOT_TOP - 10, "belt full!", BAD)
+            pieces = random.randint(2, self.p('split') + effective_level - 1)
+            if len(self.items) + len(new) + pieces - 1 > MAX_ITEMS:
+                m['last'] = 'Full'
                 return
-            it.val /= d
-            it.lane = LANES[0]
-            for k in range(1, d):
-                new.append(Item(it.x - (k // 3) * 24, LANES[k % 3], it.val, it.nxt))
-            m["last"] = f"\u00f7{d}"
-        self.pop(cx, SLOT_TOP - 10, m["last"], color)
+            it.val /= pieces
+            for _ in range(pieces - 1):
+                new.append(Item(it.step, it.progress, it.val))
+            m['last'] = f'÷{pieces}'
 
     def deliver(self, it):
-        cap = self.p("cap")
-        paid = min(it.val, cap)
+        if self.t - self.last_delivery_time <= 1.5:
+            self.combo = min(20, self.combo + 1)
+        else:
+            self.combo = 0
+        self.last_delivery_time = self.t
+        combo_bonus = 1.0 + self.combo * 0.025
+        research_bonus = 1.0 + self.research['profit'] * 0.15
+        paid = min(it.val, self.p('cap')) * combo_bonus * research_bonus
         self.money += paid
         self.total += paid
         self.best = max(self.best, paid)
         self.delivered += 1
         self.last_paid = paid
-        self.export_flash = 0.2
         self.recent.append((self.t, paid))
-        self.pop(BELT_X1 + 85 + random.randint(-30, 30), 114, "+$" + fmt(paid), GOOD)
-        if it.val > cap * 1.000001:
-            self.pop(BELT_X1 + 85, 96, "over the limit", MONEY)
+        if self.overdrive_time <= 0:
+            self.overdrive_charge = min(100.0, self.overdrive_charge + 1.5 +
+                                        8.5 * min(1.0, it.val / self.p('cap')))
 
-    # ---- persistence
     def save(self):
-        d = dict(money=self.money, total=self.total, best=self.best, delivered=self.delivered,
-                 lv=self.lv, slots_open=self.slots_open, pow_unlocked=self.pow_unlocked,
-                 slots=[m["type"] if m else None for m in self.slots])
+        data = dict(version=3, money=self.money, total=self.total, best=self.best,
+                    delivered=self.delivered, lv=self.lv, pow_unlocked=self.pow_unlocked,
+                    source=list(self.source), source_dir=self.source_dir, export=list(self.export),
+                    belts=[[x, y, direction] for (x, y), direction in self.belts.items()],
+                    machines=[[x, y, m['type'], m['level'], m['invested']]
+                              for (x, y), m in self.machines.items()],
+                    paused=self.paused, research=self.research, blueprints=self.blueprints,
+                    order=self.order, overdrive_charge=self.overdrive_charge,
+                    overdrive_time=self.overdrive_time, play_time=self.t)
         try:
-            SAVE_PATH.write_text(json.dumps(d))
+            temporary = SAVE_PATH.with_suffix('.tmp')
+            temporary.write_text(json.dumps(data), encoding='utf-8')
+            temporary.replace(SAVE_PATH)
         except OSError:
-            pass
+            return 'Could not save progress. Check that the game folder is writable.'
 
     def load(self):
+        if not SAVE_PATH.exists():
+            return
         try:
-            d = json.loads(SAVE_PATH.read_text())
-            self.money, self.total = float(d["money"]), float(d["total"])
-            self.best, self.delivered = float(d["best"]), int(d["delivered"])
-            for k in UPGRADES:
-                self.lv[k] = max(0, min(int(d["lv"].get(k, 0)), UPGRADES[k][1]))
-            self.slots_open = max(START_SLOTS, min(int(d["slots_open"]), MAX_SLOTS))
-            self.pow_unlocked = bool(d["pow_unlocked"])
-            for i, typ in enumerate(d["slots"][:MAX_SLOTS]):
-                if typ in MACHINES and i < self.slots_open:
-                    self.slots[i] = {"type": typ, "last": None, "flash": 0.0}
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            self.reset()
+            data = json.loads(SAVE_PATH.read_text(encoding='utf-8'))
+            loaded = Sim()
+            for key in ('money', 'total', 'best'):
+                value = float(data[key])
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError('Invalid money')
+                setattr(loaded, key, value)
+            loaded.delivered = max(0, int(data['delivered']))
+            loaded.lv = {k: max(0, min(int(data['lv'].get(k, 0)), UPGRADES[k][1])) for k in UPGRADES}
+            loaded.pow_unlocked = bool(data['pow_unlocked'])
+            version = int(data.get('version', 1))
+            if version == 1:
+                # Retain every old purchased slot and its machine in a straight route.
+                count = max(3, min(10, int(data['slots_open'])))
+                loaded.belts = {(x + 2, 4): 0 for x in range(count)}
+                loaded.export = (count + 2, 4)
+                loaded.machines = {(i + 2, 4): machine(typ)
+                                   for i, typ in enumerate(data['slots'][:count]) if typ in MACHINES}
+            elif version in (2, 3):
+                def cell(value):
+                    if len(value) != 2 or any(type(v) is not int for v in value):
+                        raise ValueError('Invalid cell')
+                    result = tuple(value)
+                    if not inside(result):
+                        raise ValueError('Cell outside grid')
+                    return result
+                loaded.source, loaded.export = cell(data['source']), cell(data['export'])
+                loaded.source_dir = int(data['source_dir'])
+                if loaded.source == loaded.export or loaded.source_dir not in range(4):
+                    raise ValueError('Invalid terminals')
+                loaded.belts, loaded.machines = {}, {}
+                for x, y, direction in data['belts']:
+                    pos = cell([x, y])
+                    if type(direction) is not int or direction not in range(4) or pos in (loaded.source, loaded.export):
+                        raise ValueError('Invalid belt')
+                    loaded.belts[pos] = direction
+                for entry in data['machines']:
+                    if len(entry) not in (3, 5):
+                        raise ValueError('Invalid machine')
+                    x, y, typ = entry[:3]
+                    pos = cell([x, y])
+                    if pos not in loaded.belts or typ not in MACHINES:
+                        raise ValueError('Invalid machine')
+                    if len(entry) == 5:
+                        level, invested = int(entry[3]), float(entry[4])
+                        if level not in range(1, MAX_MACHINE_LEVEL + 1) or not math.isfinite(invested) or invested < 0:
+                            raise ValueError('Invalid machine level')
+                        loaded.machines[pos] = machine(typ, level, invested)
+                    else:
+                        loaded.machines[pos] = machine(typ)
+                loaded.paused = bool(data.get('paused', False))
+                if version == 3:
+                    loaded.research = {k: max(0, min(int(data.get('research', {}).get(k, 0)), RESEARCH[k][1]))
+                                       for k in RESEARCH}
+                    loaded.blueprints = max(0, int(data.get('blueprints', 0)))
+                    loaded.order = max(0, min(int(data.get('order', 0)), len(ORDER_TARGETS)))
+                    loaded.overdrive_charge = max(0.0, min(100.0, float(data.get('overdrive_charge', 0))))
+                    loaded.overdrive_time = max(0.0, min(60.0, float(data.get('overdrive_time', 0))))
+                    loaded.t = max(0.0, float(data.get('play_time', 0)))
+            else:
+                raise ValueError('Unsupported save version')
+            loaded.rebuild_route()
+            self.__dict__.update(loaded.__dict__)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+            return 'Save could not be loaded. A fresh factory is open.'
 
 
-# ---------------------------------------------------------------------- UI --
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Number Foundry")
-        root.resizable(False, False)
-        self.c = tk.Canvas(root, width=W, height=H, bg=BG, highlightthickness=0)
-        self.c.pack()
-        fams = set(tkfont.families())
-        self.fam = next((f for f in ("Segoe UI", "Helvetica Neue", "DejaVu Sans", "Arial") if f in fams), "Helvetica")
-        self.mono = next((f for f in ("Consolas", "Menlo", "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
+        root.title('Number Foundry — build your own factory')
+        root.geometry(f'{W}x{H}')
+        root.minsize(1000, 680)
+        root.configure(bg=BG)
         self.sim = Sim()
-        self.sim.load()
-        self.tool, self.paused = None, False
-        self.msg, self.msg_until = "", 0.0
-        self.mouse, self.hits, self.tip = (-1, -1), [], ""
-        c = self.c
-        c.bind("<Button-1>", lambda e: self.click(e.x, e.y, False))
-        c.bind("<Button-3>", lambda e: self.click(e.x, e.y, True))
-        if sys.platform == "darwin":
-            c.bind("<Button-2>", lambda e: self.click(e.x, e.y, True))
-            c.bind("<Control-Button-1>", lambda e: self.click(e.x, e.y, True))
-        c.bind("<Motion>", lambda e: setattr(self, "mouse", (e.x, e.y)))
-        c.bind("<Leave>", lambda e: setattr(self, "mouse", (-1, -1)))
-        root.bind("<Key>", self.key)
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        c.create_rectangle(0, 0, W, HEADER_H, fill=PANEL, outline="")
-        c.create_rectangle(0, 346, W, H, fill=PANEL, outline="")
-        c.create_rectangle(SRC_X1, BELT_Y - 32, BELT_X1, BELT_Y + 32, fill=BELT, outline=LINE)
+        load_error = self.sim.load()
+        self.tool, self.direction, self.fullscreen = 'belt', 0, False
+        self.hover = None
+        self.msg_until = 0.0
+        self.view = (0, 0, 1)
+        self.buttons, self.upgrade_buttons, self.research_buttons = {}, {}, {}
+        self.header = tk.Frame(root, bg=PANEL, padx=16, pady=10)
+        self.header.pack(fill='x')
+        self.balance = self.label(self.header, '', 23, MONEY)
+        self.balance.pack(side='left')
+        self.stats = self.label(self.header, '', 11, DIM)
+        self.stats.pack(side='left', padx=24)
+        self.button(self.header, 'Fullscreen · F11', self.toggle_fullscreen).pack(side='right', padx=4)
+        self.pause_button = self.button(self.header, 'Pause · Space', self.toggle_pause)
+        self.pause_button.pack(side='right', padx=4)
+        body = tk.Frame(root, bg=BG)
+        body.pack(fill='both', expand=True)
+        side_container = tk.Frame(body, bg=PANEL)
+        side_container.pack(side='right', fill='y')
+        side_canvas = tk.Canvas(side_container, width=290, bg=PANEL, highlightthickness=0)
+        scrollbar = tk.Scrollbar(side_container, orient='vertical', command=side_canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        side_canvas.pack(side='left', fill='y')
+        side_canvas.configure(yscrollcommand=scrollbar.set)
+        sidebar = tk.Frame(side_canvas, bg=PANEL, padx=12, pady=8)
+        side_window = side_canvas.create_window(0, 0, window=sidebar, anchor='nw', width=290)
+        sidebar.bind('<Configure>', lambda e: side_canvas.configure(scrollregion=side_canvas.bbox('all')))
+        side_canvas.bind('<Configure>', lambda e: side_canvas.itemconfigure(side_window, width=e.width))
+        self.label(sidebar, 'BUILD YOUR FACTORY', 13, TEXT).pack(anchor='w', pady=(0, 6))
+        self.add_tool(sidebar, 'belt', 'Belt tile · $5 [B]')
+        directions = tk.Frame(sidebar, bg=PANEL)
+        directions.pack(fill='x', pady=3)
+        self.dir_buttons = []
+        for i, arrow in enumerate(ARROWS):
+            button = self.button(directions, arrow, lambda i=i: self.set_direction(i))
+            button.pack(side='left', expand=True, fill='x', padx=2)
+            self.dir_buttons.append(button)
+        self.add_tool(sidebar, 'rotate', 'Rotate existing tile · free [R]')
+        self.add_tool(sidebar, 'export', 'Move export · free [E]')
+        self.add_tool(sidebar, 'sell', 'Sell machine / belt [X]')
+        self.add_tool(sidebar, 'machine_up', 'Upgrade placed machine [U]')
+        self.label(sidebar, 'MACHINES · place on a belt', 12, DIM).pack(anchor='w', pady=(10, 4))
+        for i, typ in enumerate(MACHINE_ORDER):
+            self.add_tool(sidebar, typ, f"{MACHINES[typ]['name']} · ${MACHINES[typ]['cost']} [{i + 1}]")
+        self.label(sidebar, 'CONTRACT', 12, DIM).pack(anchor='w', pady=(10, 4))
+        self.contract_label = self.label(sidebar, '', 10, TEXT)
+        self.contract_label.pack(fill='x', pady=2)
+        self.claim_button = self.button(sidebar, 'Claim contract reward',
+                                        lambda: self.action(self.sim.claim_order))
+        self.claim_button.pack(fill='x', pady=2)
+        self.overdrive_button = self.button(sidebar, '', lambda: self.action(self.sim.activate_overdrive))
+        self.overdrive_button.pack(fill='x', pady=(8, 2))
+        self.label(sidebar, 'BLUEPRINT RESEARCH', 12, DIM).pack(anchor='w', pady=(10, 4))
+        for key in RESEARCH:
+            b = self.button(sidebar, '', lambda key=key: self.action(self.sim.buy_research, key))
+            b.pack(fill='x', pady=2)
+            self.research_buttons[key] = b
+        self.label(sidebar, 'UPGRADES', 12, DIM).pack(anchor='w', pady=(10, 4))
+        for key in UPGRADES:
+            b = self.button(sidebar, '', lambda key=key: self.action(self.sim.buy_upgrade, key))
+            b.pack(fill='x', pady=2)
+            b.bind('<Enter>', lambda e, key=key: self.flash(UPGRADE_TIPS[key]))
+            self.upgrade_buttons[key] = b
+        self.button(sidebar, 'Reset save', self.reset).pack(fill='x', pady=(12, 6))
+        def scroll(event):
+            side_canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+        def bind_scroll(widget):
+            widget.bind('<MouseWheel>', scroll)
+            for child in widget.winfo_children():
+                bind_scroll(child)
+        bind_scroll(sidebar)
+        side_canvas.bind('<MouseWheel>', scroll)
+        workspace = tk.Frame(body, bg=BG)
+        workspace.pack(side='left', fill='both', expand=True)
+        self.route_label = self.label(workspace, '', 12, GOOD)
+        self.route_label.pack(anchor='w', padx=16, pady=(12, 4))
+        self.tool_label = self.label(workspace, '', 11, DIM)
+        self.tool_label.pack(anchor='w', padx=16)
+        self.c = tk.Canvas(workspace, bg=BG, highlightthickness=0)
+        self.c.pack(fill='both', expand=True, padx=12, pady=8)
+        self.label(workspace, 'Click to build • Arrow keys choose direction • Right-click sells • Space pauses', 11, DIM).pack(pady=2)
+        self.label(workspace, 'Belts refund $5; machines refund 50%. Changing the route clears numbers in transit.', 10, DIM).pack(pady=(0, 10))
+        self.status = self.label(root, '', 11, MONEY)
+        self.status.pack(fill='x', padx=16, pady=8)
+        self.c.bind('<Button-1>', lambda e: self.click(e, False))
+        self.c.bind('<Button-3>', lambda e: self.click(e, True))
+        self.c.bind('<Motion>', self.motion)
+        self.c.bind('<Leave>', lambda e: setattr(self, 'hover', None))
+        root.bind('<KeyPress>', self.key)
+        root.protocol('WM_DELETE_WINDOW', self.close)
         self.last = self.last_save = time.perf_counter()
-        self.flash("You have $10. Pick the Multiplier below, then click a slot on the belt.")
+        self.flash(load_error or 'Start with a $10 Adder. Finish contracts to earn blueprints and grow your factory.')
         self.frame()
 
-    # ---- fonts / drawing helpers
-    def F(self, px, weight="normal"):
-        return (self.fam, -px, weight)
+    def label(self, parent, text, size=12, color=TEXT):
+        return tk.Label(parent, text=text, font=('Segoe UI', size), bg=parent.cget('bg'), fg=color, anchor='w')
 
-    def text(self, x, y, s, size=12, color=TEXT, anchor="center", weight="normal", mono=False):
-        font = (self.mono, -size, weight) if mono else self.F(size, weight)
-        self.c.create_text(x, y, text=s, fill=color, anchor=anchor, font=font, tags="dyn")
+    def button(self, parent, text, command):
+        return tk.Button(parent, text=text, command=command, font=('Segoe UI', 10),
+                         bg=CARD, fg=TEXT, activebackground=CARD_HOV, activeforeground=TEXT,
+                         relief='flat', bd=0, padx=8, pady=4, cursor='hand2', takefocus=False)
 
-    def rrect(self, x0, y0, x1, y1, r=8, **kw):
-        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
-               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-        self.c.create_polygon(pts, smooth=True, tags="dyn", **kw)
+    def add_tool(self, parent, tool, text):
+        button = self.button(parent, text, lambda: self.select_tool(tool))
+        button.pack(fill='x', pady=2)
+        self.buttons[tool] = button
 
-    def hit(self, x0, y0, x1, y1, kind, arg=None, tip=""):
-        self.hits.append((x0, y0, x1, y1, kind, arg))
-        mx, my = self.mouse
-        hov = x0 <= mx <= x1 and y0 <= my <= y1
-        if hov and tip:
-            self.tip = tip
-        return hov
+    def select_tool(self, tool):
+        if tool == 'pow' and not self.sim.pow_unlocked:
+            error = self.sim.unlock_machine(tool)
+            if error:
+                self.flash(error)
+                return
+        self.tool = tool
 
-    def flash(self, msg):
-        self.msg, self.msg_until = msg, time.perf_counter() + 3.5
+    def set_direction(self, direction):
+        self.direction, self.tool = direction, 'belt'
 
-    # ---- input
-    def key(self, e):
-        s = self.sim
-        if e.keysym == "space":
-            self.paused = not self.paused
-        elif e.keysym == "Escape":
-            self.tool = None
-        elif e.keysym in ("1", "2", "3"):
-            k = MACHINE_ORDER[int(e.keysym) - 1]
-            if k != "pow" or s.pow_unlocked:
-                self.tool = None if self.tool == k else k
+    def toggle_pause(self):
+        self.sim.paused = not self.sim.paused
 
-    def click(self, x, y, right):
-        for x0, y0, x1, y1, kind, arg in reversed(self.hits):
-            if x0 <= x <= x1 and y0 <= y <= y1:
-                return self.act(kind, arg, right)
-        if right:
-            self.tool = None
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self.root.attributes('-fullscreen', self.fullscreen)
 
-    def act(self, kind, arg, right):
-        s, msg = self.sim, None
-        if kind == "slot":
-            if right:
-                s.sell(arg)
-            elif self.tool:
-                msg = s.place(arg, self.tool)
-            elif not s.slots[arg]:
-                msg = "Pick a machine below first (or press 1, 2, 3)."
-        elif kind == "tool" and not right:
-            if arg == "pow" and not s.pow_unlocked:
-                msg = s.unlock_machine("pow")
-                if s.pow_unlocked:
-                    self.tool = "pow"
+    def key(self, event):
+        key = event.keysym
+        if key == 'F11':
+            self.toggle_fullscreen()
+        elif key == 'Escape':
+            if self.fullscreen:
+                self.toggle_fullscreen()
             else:
-                self.tool = None if self.tool == arg else arg
-        elif kind == "unlock":
-            msg = s.unlock_slot()
-        elif kind == "upgrade":
-            msg = s.buy_upgrade(arg)
-        elif kind == "pause":
-            self.paused = not self.paused
-        elif kind == "reset":
-            if messagebox.askyesno("Reset", "Delete all progress and start over?"):
-                s.reset()
                 self.tool = None
-                s.save()
-        if msg:
-            self.flash(msg)
+        elif key == 'space':
+            self.toggle_pause()
+        elif key in ('Right', 'Down', 'Left', 'Up'):
+            self.set_direction(('Right', 'Down', 'Left', 'Up').index(key))
+        elif key.lower() == 'o':
+            self.action(self.sim.activate_overdrive)
+        elif key.lower() in ('b', 'r', 'e', 'x', 'u', '1', '2', '3', '4'):
+            self.select_tool(dict(b='belt', r='rotate', e='export', x='sell', u='machine_up',
+                                  **{'1': 'add', '2': 'mul', '3': 'div', '4': 'pow'})[key.lower()])
+        return 'break'
+
+    def cell_at(self, x, y):
+        ox, oy, size = self.view
+        cell = (int((x - ox) // size), int((y - oy) // size))
+        return cell if inside(cell) else None
+
+    def motion(self, event):
+        self.hover = self.cell_at(event.x, event.y)
+
+    def click(self, event, right):
+        cell = self.cell_at(event.x, event.y)
+        if cell is None:
+            return
+        s = self.sim
+        if right or self.tool == 'sell':
+            self.action(s.sell, cell)
+        elif self.tool == 'belt':
+            self.action(s.place_belt, cell, self.direction)
+        elif self.tool == 'rotate':
+            self.action(s.rotate, cell)
+        elif self.tool == 'export':
+            self.action(s.move_export, cell)
+        elif self.tool == 'machine_up':
+            self.action(s.upgrade_machine, cell)
+        elif self.tool in MACHINES:
+            self.action(s.place, cell, self.tool)
+
+    def action(self, fn, *args):
+        error = fn(*args)
+        if error:
+            self.flash(error)
+
+    def flash(self, text):
+        self.status.configure(text=text)
+        self.msg_until = time.perf_counter() + 6
+
+    def reset(self):
+        if messagebox.askyesno('Reset', 'Delete all progress and start over?', parent=self.root):
+            self.sim.reset()
+            self.action(self.sim.save)
 
     def close(self):
-        self.sim.save()
+        error = self.sim.save()
+        if error:
+            messagebox.showerror('Save failed', error, parent=self.root)
+            return
         self.root.destroy()
 
-    # ---- main loop
     def frame(self):
         now = time.perf_counter()
         dt, self.last = min(now - self.last, 0.05), now
-        if not self.paused:
-            self.sim.update(dt)
+        self.sim.update(dt)
         if now - self.last_save > 20:
-            self.sim.save()
+            self.action(self.sim.save)
             self.last_save = now
         self.draw()
-        self.root.after(16, self.frame)
+        self.frame_id = self.root.after(33, self.frame)
 
     def draw(self):
-        self.c.delete("dyn")
-        self.hits, self.tip = [], ""
-        self.draw_header()
-        self.draw_factory()
-        self.draw_machines()
-        self.draw_upgrades()
-        self.draw_status()
-
-    def draw_header(self):
-        s = self.sim
-        self.text(24, 18, "Number Foundry", 15, DIM, "w", "bold")
-        self.text(24, 50, "$" + fmt(s.money), 30, MONEY, "w", "bold")
-        stats = [("Income per second", "$" + fmt(s.income())), ("Total exported", "$" + fmt(s.total)),
-                 ("Best delivery", "$" + fmt(s.best)), ("Numbers on belt", str(len(s.items)))]
-        for i, (label, val) in enumerate(stats):
-            x = 400 + i * 200
-            self.text(x, 22, label, 12, DIM, "w")
-            self.text(x, 50, val, 20, TEXT, "w", "bold")
-
-    def draw_factory(self):
         s, c = self.sim, self.c
-        # belt chevrons
-        off = s.phase
-        x = BELT_X0 + off - 26
-        while x < BELT_X1 - 8:
-            if x > SRC_X1:
-                c.create_line(x, BELT_Y - 7, x + 7, BELT_Y, x, BELT_Y + 7, fill=CHEV, width=2, tags="dyn")
-            x += 26
-        # source
-        self.rrect(24, 150, SRC_X1, 250, 10, fill=CARD, outline=LINE)
-        self.text(71, 168, "Source", 13, DIM, weight="bold")
-        self.text(71, 203, fmt(s.p("seed")), 30, MONEY, weight="bold")
-        self.text(71, 234, f"every {s.p('rate'):.2f}s", 12, DIM)
-        # export
-        fl = s.export_flash > 0
-        self.rrect(BELT_X1, 130, W - 24, 270, 10, fill=mix(CARD, GOOD, 0.35 if fl else 0.0),
-                   outline=GOOD if fl else LINE)
-        ex = (BELT_X1 + W - 24) / 2
-        self.text(ex, 150, "Export", 15, GOOD, weight="bold")
-        self.text(ex, 184, "Crate limit", 12, DIM)
-        self.text(ex, 206, "$" + fmt(s.p("cap")), 20, TEXT, weight="bold")
-        self.text(ex, 238, "Last delivery", 12, DIM)
-        self.text(ex, 256, "$" + fmt(s.last_paid), 14, GOOD, weight="bold")
-        # slots
-        for i in range(MAX_SLOTS):
-            self.draw_slot(i)
-        # items
-        dense = len(s.items) > 140
-        for it in s.items:
-            y = BELT_Y + it.lane
-            v = it.val
-            col = PALETTE[0 if v < 1000 else min(len(PALETTE) - 1, int(math.log10(v)) // 3)]
-            if dense:
-                c.create_oval(it.x - 4, y - 4, it.x + 4, y + 4, fill=col, outline="", tags="dyn")
-            else:
-                t = fmt(v)
-                hw = 6 + 3.6 * len(t)
-                c.create_rectangle(it.x - hw, y - 9, it.x + hw, y + 9, fill=col, outline=BELT, tags="dyn")
-                self.text(it.x, y, t, 12, "#0d1f33", weight="bold", mono=True)
-        # floating texts
-        for x, y, t, col, life in s.floaters:
-            self.text(x, y, t, 15, mix(BG, col, life * 2.2), weight="bold")
-
-    def draw_slot(self, i):
-        s = self.sim
-        cx = slot_cx(i)
-        x0, x1 = cx - 38, cx + 38
-        if i >= s.slots_open:
-            self.c.create_rectangle(x0, SLOT_TOP, x1, SLOT_BOT, outline=CHEV, dash=(3, 5), tags="dyn")
-            if i == s.slots_open:
-                cost = s.slot_cost()
-                ok = s.money >= cost
-                hov = self.hit(x0, 290, x1, 326, "unlock", tip=f"Unlock slot {i + 1} for ${fmt(cost)}.")
-                self.rrect(x0, 290, x1, 326, 6, fill=CARD_HOV if hov else CARD, outline=GOOD if ok else LINE)
-                self.text(cx, 300, "Unlock slot", 11, DIM)
-                self.text(cx, 316, "$" + fmt(cost), 13, GOOD if ok else BAD, weight="bold")
-            return
-        m = s.slots[i]
-        hov = self.hit(x0 - 2, SLOT_TOP - 4, x1 + 2, SLOT_BOT + 4, "slot", i)
-        self.text(cx, 284, str(i + 1), 11, DIM)
-        if not m:
-            ghost = self.tool and hov
-            col = MACHINES[self.tool]["color"] if ghost else CHEV
-            self.c.create_rectangle(x0, SLOT_TOP, x1, SLOT_BOT, outline=col, dash=(4, 4), width=2 if ghost else 1, tags="dyn")
-            self.text(cx, 147, MACHINES[self.tool]["sym"] if ghost else "+", 26, col, weight="bold")
-            if hov:
-                self.tip = "Empty slot. Choose a machine below, then click here." if not self.tool else \
-                    f"Place a {MACHINES[self.tool]['name']} here for ${MACHINES[self.tool]['cost']}."
-            return
-        spec = MACHINES[m["type"]]
-        col, on = spec["color"], m["flash"] > 0
-        self.c.create_rectangle(x0, SLOT_TOP, x1, SLOT_BOT, outline=col, width=3 if on else 2, tags="dyn")
-        self.c.create_rectangle(x0 + 4, SLOT_TOP + 4, x1 - 4, SLOT_TOP + 38, fill=col if on else mix(BG, col, 0.28),
-                                outline="", tags="dyn")
-        self.text(cx, SLOT_TOP + 22, spec["sym"], 28, BG if on else col, weight="bold")
-        self.c.create_rectangle(x0 + 4, SLOT_BOT - 38, x1 - 4, SLOT_BOT - 4, fill=mix(BG, col, 0.12), outline="", tags="dyn")
-        self.text(cx, SLOT_BOT - 27, self.range_text(m["type"]), 11, DIM)
-        self.text(cx, SLOT_BOT - 12, m["last"] or "\u2013", 13, TEXT, weight="bold")
-        if hov:
-            self.tip = (f"{spec['name']}: {self.machine_desc(m['type'])}  Right-click to sell "
-                        f"(+${fmt(spec['cost'] * 0.5)}).")
-
-    def range_text(self, typ):
-        s = self.sim
-        if typ == "mul":
-            lo, hi = s.p("mulq")
-            return f"{lo:.1f}\u2013{hi:.1f}"
-        return f"2\u2013{s.p('split')}" if typ == "div" else "1.10\u20131.35"
-
-    def machine_desc(self, typ):
-        r = self.range_text(typ)
-        return {"mul": f"multiplies by a random \u00d7{r}.",
-                "div": f"splits a number into {r.replace(chr(0x2013), ' to ')} equal pieces.",
-                "pow": f"raises a number to a random power of {r.replace(chr(0x2013), ' to ')}."}[typ]
-
-    def draw_machines(self):
-        s = self.sim
-        self.text(24, 366, "Machines", 15, TEXT, "w", "bold")
-        for n, key in enumerate(MACHINE_ORDER):
-            spec = MACHINES[key]
-            x0, y0, x1, y1 = 24, 386 + n * 74, 384, 386 + n * 74 + 66
-            locked = key == "pow" and not s.pow_unlocked
-            price = spec["unlock"] if locked else spec["cost"]
-            ok = s.money >= price
-            tip = f"{spec['name']} {self.machine_desc(key)}"
-            hov = self.hit(x0, y0, x1, y1, "tool", key, tip)
-            sel = self.tool == key
-            self.rrect(x0, y0, x1, y1, 8, fill=CARD_HOV if hov else CARD, outline=spec["color"] if sel else LINE,
-                       width=2 if sel else 1)
-            self.rrect(x0 + 10, y0 + 8, x0 + 60, y0 + 58, 6, fill=mix(BG, spec["color"], 0.25), outline="")
-            self.text(x0 + 35, y0 + 33, spec["sym"], 28, spec["color"], weight="bold")
-            self.text(x0 + 72, y0 + 22, f"{spec['name']}", 15, TEXT, "w", "bold")
-            self.text(x0 + 72, y0 + 46, self.range_text(key) if not locked else "Locked", 12, DIM, "w")
-            label = f"Unlock ${fmt(price)}" if locked else f"${fmt(price)}"
-            self.text(x1 - 12, y0 + 22, label, 14, GOOD if ok else BAD, "e", "bold")
-            self.text(x1 - 12, y0 + 46, "selected" if sel else f"key {n + 1}", 12, spec["color"] if sel else DIM, "e")
-        for i, line in enumerate(("Click a slot to place the selected machine.",
-                                  "Right-click a machine to sell it for half.",
-                                  "Space pauses. Esc puts the machine down.")):
-            self.text(24, 622 + i * 20, line, 12, DIM, "w")
-
-    def draw_upgrades(self):
-        s = self.sim
-        self.text(410, 366, "Upgrades", 15, TEXT, "w", "bold")
-        for n, key in enumerate(UPGRADE_ORDER):
-            name, mx, *_ = UPGRADES[key]
-            x0 = 410 + (n % 2) * 386
-            y0 = 386 + (n // 2) * 76
-            x1, y1 = x0 + 374, y0 + 68
-            lvl, cost = s.lv[key], s.upgrade_cost(key)
-            maxed = lvl >= mx
-            ok = s.money >= cost
-            hov = self.hit(x0, y0, x1, y1, "upgrade", key, UPGRADE_TIPS[key])
-            self.rrect(x0, y0, x1, y1, 8, fill=CARD_HOV if hov and not maxed else CARD, outline=GOOD if ok and not maxed else LINE)
-            self.text(x0 + 12, y0 + 18, name, 14, TEXT, "w", "bold")
-            self.text(x1 - 12, y0 + 18, f"Level {lvl}/{mx}", 12, DIM, "e")
-            cur = SHOW[key](s.p(key, lvl))
-            desc = PREFIX[key] + (cur if maxed else f"{cur} \u2192 {SHOW[key](s.p(key, lvl + 1))}")
-            self.text(x0 + 12, y0 + 40, desc, 12, DIM, "w")
-            self.text(x1 - 12, y0 + 40, "max" if maxed else "$" + fmt(cost), 13, DIM if maxed else GOOD if ok else BAD, "e", "bold")
-            self.c.create_rectangle(x0 + 12, y0 + 55, x1 - 12, y0 + 59, fill=BELT, outline="", tags="dyn")
-            if lvl:
-                self.c.create_rectangle(x0 + 12, y0 + 55, x0 + 12 + (x1 - x0 - 24) * lvl / mx, y0 + 59,
-                                        fill=GOOD, outline="", tags="dyn")
-        # pause / reset
-        y0 = 386 + 3 * 76
-        for j, (kind, label) in enumerate((("pause", "Resume" if self.paused else "Pause"), ("reset", "Reset save"))):
-            x0 = 410 + 386 + j * 193
-            hov = self.hit(x0, y0, x0 + 181, y0 + 68, kind, tip="Progress is saved automatically." if kind == "reset" else "")
-            self.rrect(x0, y0, x0 + 181, y0 + 68, 8, fill=CARD_HOV if hov else CARD, outline=LINE)
-            self.text(x0 + 90, y0 + 34, label, 14, TEXT, weight="bold")
-        if self.paused:
-            self.rrect(W / 2 - 110, 60, W / 2 + 110, 104, 10, fill=PANEL, outline=MONEY)
-            self.text(W / 2, 82, "Paused. Press Space.", 15, MONEY, weight="bold")
-
-    def draw_status(self):
-        if time.perf_counter() < self.msg_until:
-            self.text(24, 336, self.msg, 13, MONEY, "w", "bold")
-        elif self.tip:
-            self.text(24, 336, self.tip, 13, TEXT, "w")
-        elif self.tool:
-            self.text(24, 336, f"Placing: {MACHINES[self.tool]['name']}. Click a slot on the belt.", 13, MACHINES[self.tool]["color"], "w")
+        self.balance.configure(text='$' + fmt(s.money))
+        self.stats.configure(text=f'Income ${fmt(s.income())}/s   •   Exported ${fmt(s.total)}\n'
+                                  f'Combo ×{1 + s.combo * .025:.2f}   •   Play time {clock(s.t)}   •   Last +${fmt(s.last_paid)}')
+        self.pause_button.configure(text='Resume · Space' if s.paused else 'Pause · Space',
+                                    bg=MONEY if s.paused else CARD, fg=BG if s.paused else TEXT)
+        route_text = s.route_error or f'Connected to export • {len(s.route) - 2} belt tiles on your route'
+        available = max(300, self.c.winfo_width() - 12)
+        self.route_label.configure(wraplength=available, justify='left')
+        self.tool_label.configure(wraplength=available, justify='left')
+        self.route_label.configure(text=('PAUSED — build freely  |  ' if s.paused else '') + route_text,
+                                   fg=MONEY if s.paused else BAD if s.route_error else GOOD)
+        descriptions = {'belt': f'Belt {ARROWS[self.direction]} · $5 per new tile · changing direction is free',
+                        'rotate': 'Rotate: click a belt or source to turn it clockwise',
+                        'export': 'Export: click an empty tile at the end of your route',
+                        'sell': 'Sell: click once for the machine, again for the belt',
+                        'machine_up': 'Upgrade: click a placed machine to improve only that machine',
+                        None: 'Choose a building tool or machine from the sidebar'}
+        self.tool_label.configure(text=descriptions.get(self.tool, 'Machine: click a belt to place it'))
+        for key, button in self.buttons.items():
+            button.configure(bg=CARD_HOV if self.tool == key else CARD,
+                             fg=MONEY if self.tool == key else TEXT)
+        for i, typ in enumerate(MACHINE_ORDER):
+            spec = MACHINES[typ]
+            self.buttons[typ].configure(text=f"{spec['name']} · ${fmt(spec['cost'])} [{i + 1}]")
+        if not s.pow_unlocked:
+            self.buttons['pow'].configure(text=f"Unlock Exponentiator · ${fmt(MACHINES['pow']['unlock'])} [4]")
+        target = s.order_target()
+        if target is None:
+            self.contract_label.configure(text='All 18 contracts complete!\nYour foundry is legendary.', fg=GOOD)
+            self.claim_button.configure(text='Campaign complete', state='disabled')
         else:
-            self.text(24, 336, "Numbers pick up a random change at every machine. Reach the Export with the biggest number you can.", 13, DIM, "w")
+            progress = min(1.0, s.total / target)
+            self.contract_label.configure(
+                text=f'Contract {s.order + 1}/{len(ORDER_TARGETS)}\nExport ${fmt(target)} total  ({progress:.0%})\n'
+                     f'Reward: ${fmt(s.order_reward())} + 1 blueprint', fg=TEXT)
+            self.claim_button.configure(text='Claim reward' if progress >= 1 else f'Progress {progress:.0%}',
+                                        state='normal', fg=GOOD if progress >= 1 else TEXT)
+        active_drive = s.overdrive_time > 0
+        self.overdrive_button.configure(
+            text=(f'OVERDRIVE ACTIVE · {s.overdrive_time:.1f}s' if active_drive else
+                  f'Overdrive · {s.overdrive_charge:.0f}% [O]'),
+            bg=MONEY if active_drive else CARD_HOV if s.overdrive_charge >= 100 else CARD,
+            fg=BG if active_drive else GOOD if s.overdrive_charge >= 100 else TEXT)
+        for key, button in self.research_buttons.items():
+            name, maximum, _ = RESEARCH[key]
+            level = s.research[key]
+            cost = s.research_cost(key)
+            button.configure(text=f'{name} {level}/{maximum} · ' + ('MAX' if level >= maximum else f'{cost} BP'),
+                             fg=DIM if level >= maximum else GOOD if s.blueprints >= cost else TEXT)
+        for i, button in enumerate(self.dir_buttons):
+            button.configure(bg=GOOD if i == self.direction else CARD, fg=BG if i == self.direction else TEXT)
+        for key, button in self.upgrade_buttons.items():
+            name, mx, *_ = UPGRADES[key]
+            maxed = s.lv[key] >= mx
+            price = 'MAX' if maxed else '$' + fmt(s.upgrade_cost(key))
+            button.configure(text=f'{name}  {s.lv[key]}/{mx} · {price}',
+                             fg=DIM if maxed else GOOD if s.money >= s.upgrade_cost(key) else TEXT)
+        if time.perf_counter() > self.msg_until:
+            self.status.configure(text=f'{s.blueprints} blueprints • Crate limit ${fmt(s.p("cap"))} • '
+                                       'Autosaves every 20 seconds • F11 fullscreen')
+        c.delete('all')
+        width, height = max(1, c.winfo_width()), max(1, c.winfo_height())
+        size = max(1, min(width / COLS, height / ROWS))
+        ox, oy = (width - size * COLS) / 2, (height - size * ROWS) / 2
+        self.view = (ox, oy, size)
+        def center(cell):
+            return ox + (cell[0] + 0.5) * size, oy + (cell[1] + 0.5) * size
+        font_size = max(8, int(size * 0.2))
+        active = set(s.route)
+        for y in range(ROWS):
+            for x in range(COLS):
+                cell = (x, y)
+                cx, cy = center(cell)
+                half = size / 2
+                color = BELT if cell in s.belts else BG
+                outline = MONEY if cell == self.hover else CHEV
+                c.create_rectangle(cx-half+1, cy-half+1, cx+half-1, cy+half-1, fill=color, outline=outline)
+                if cell in s.belts:
+                    direction = s.belts[cell]
+                    dx, dy = DIRECTIONS[direction]
+                    c.create_line(cx-dx*size*.3, cy-dy*size*.3, cx+dx*size*.32, cy+dy*size*.32,
+                                  arrow='last', fill=GOOD if cell in active and not s.route_error else DIM, width=2)
+                if cell in s.machines:
+                    m = s.machines[cell]
+                    spec = MACHINES[m['type']]
+                    c.create_rectangle(cx-size*.38, cy-size*.43, cx+size*.38, cy-size*.03,
+                                       fill=spec['color'] if m['flash'] else CARD, outline=spec['color'])
+                    c.create_text(cx, cy-size*.23, text=spec['sym'], fill=BG if m['flash'] else spec['color'],
+                                  font=('Segoe UI', font_size+3, 'bold'))
+                    detail = f"Lv{m['level']}" + (f"  {m['last']}" if m['last'] else '')
+                    c.create_text(cx, cy+size*.34, text=detail, fill=spec['color'],
+                                  font=('Segoe UI', max(7, font_size-1)))
+        for cell, title, color, detail in ((s.source, 'SOURCE', MONEY, ARROWS[s.source_dir]),
+                                           (s.export, 'EXPORT', GOOD, '$')):
+            cx, cy = center(cell)
+            c.create_rectangle(cx-size*.47, cy-size*.47, cx+size*.47, cy+size*.47, fill=CARD, outline=color, width=2)
+            c.create_text(cx, cy-size*.18, text=title, fill=color, font=('Segoe UI', max(7, font_size-1), 'bold'))
+            c.create_text(cx, cy+size*.16, text=detail, fill=color, font=('Segoe UI', font_size+5, 'bold'))
+        for i, item in enumerate(s.items):
+            if item.step >= len(s.route) - 1:
+                continue
+            x0, y0 = center(s.route[item.step])
+            x1, y1 = center(s.route[item.step + 1])
+            progress = min(1.0, item.progress)
+            cx, cy = x0 + (x1-x0)*progress, y0 + (y1-y0)*progress
+            radius = max(3, size*.085)
+            c.create_oval(cx-radius, cy-radius, cx+radius, cy+radius, fill=MONEY, outline=BG)
+            if len(s.items) < 60:
+                c.create_text(cx, cy+size*.2, text=fmt(item.val), fill=TEXT, font=('Segoe UI', max(7, font_size-1)))
+        if self.hover is not None and self.tool == 'belt' and self.hover not in s.belts and self.hover not in (s.source, s.export):
+            cx, cy = center(self.hover)
+            c.create_text(cx, cy, text=ARROWS[self.direction], fill=DIM, font=('Segoe UI', font_size+8))
 
 
 def main():
@@ -604,5 +822,5 @@ def main():
     root.mainloop()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

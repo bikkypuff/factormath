@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+number_foundry_save.json
+number_foundry_save.tmp
